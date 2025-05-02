@@ -9,7 +9,11 @@
 #include <set>       // Needed for std::set to store unique printed chunk indices
 #include <numeric>   // Needed for std::iota
 #include <limits>    // Needed for std::numeric_limits
+#include <nlohmann/json.hpp> // JSON library
 #include "CLI/CLI.hpp"
+
+// Use nlohmann::json
+using json = nlohmann::json;
 
 // Structure to represent a text chunk
 struct Chunk {
@@ -37,6 +41,11 @@ struct Chunk {
             }
         }
         return result;
+    }
+
+    // Function to convert Chunk to JSON
+    void to_json(json& j, const Chunk& c) {
+        j = json{{"startLine", c.startLine}, {"lines", c.lines}};
     }
 };
 
@@ -207,37 +216,50 @@ int main(int argc, char** argv) {
         ->default_val("paragraph")
         ->check(CLI::IsMember({"paragraph", "brace"}));
 
+    std::string outputFormat = "text";
+    app.add_option("--output-format", outputFormat, "Output format (text, json)")
+        ->default_val("text")
+        ->check(CLI::IsMember({"text", "json"}));
+
     CLI11_PARSE(app, argc, argv);
 
-    std::cout << "Processing file: " << filePath << std::endl;
-    std::cout << "Search query: '" << query << "'" << std::endl;
-    std::cout << "Search mode: " << searchMode << std::endl;
+    // --- Conditional output based on format ---
+    auto printInfo = [&](const std::string& msg) {
+        if (outputFormat == "text") {
+            std::cout << msg << std::endl;
+        }
+    };
+
+    printInfo("Processing file: " + filePath);
+    printInfo("Search query: '" + query + "'");
+    printInfo("Search mode: " + searchMode);
     if (searchMode == "fuzzy") {
-        std::cout << "Fuzzy tolerance: " << fuzzyTolerance << std::endl;
+        printInfo("Fuzzy tolerance: " + std::to_string(fuzzyTolerance));
     }
-    std::cout << "Context chunks: " << contextChunks << std::endl;
-    std::cout << "Ignore comments: " << (ignoreComments ? "Yes" : "No") << std::endl;
-    std::cout << "Chunk mode: " << chunkMode << std::endl;
+    printInfo("Context chunks: " + std::to_string(contextChunks));
+    printInfo("Ignore comments: " + std::string(ignoreComments ? "Yes" : "No"));
+    printInfo("Chunk mode: " + chunkMode);
+    printInfo("Output format: " + outputFormat);
 
     try {
         std::vector<std::string> fileContent = readFileLines(filePath);
-        std::cout << "Successfully read " << fileContent.size() << " lines from file." << std::endl;
+        printInfo("Successfully read " + std::to_string(fileContent.size()) + " lines from file.");
 
         // --- Chunking --- 
         std::vector<Chunk> chunks;
         if (chunkMode == "paragraph") {
              chunks = chunkByParagraphs(fileContent);
-             std::cout << "Chunked content into " << chunks.size() << " paragraphs (non-blank)." << std::endl;
+             printInfo("Chunked content into " + std::to_string(chunks.size()) + " paragraphs (non-blank).");
         } else if (chunkMode == "brace") {
             chunks = chunkByBraces(fileContent);
-             std::cout << "Chunked content into " << chunks.size() << " brace-based blocks." << std::endl;
+             printInfo("Chunked content into " + std::to_string(chunks.size()) + " brace-based blocks.");
         } else {
              // Should not happen due to CLI11 validation, but good practice
             throw std::runtime_error("Invalid chunk mode specified.");
         }
        
         // --- Search --- 
-        std::cout << "\n--- " << searchMode << " Search Results --- (" << query << ")" << std::endl;
+        printInfo("\n--- " + searchMode + " Search Results --- (" + query + ")");
         std::vector<std::pair<size_t, size_t>> matchingChunkInfo; // Store {chunk_index, match_score (0 for keyword, distance for fuzzy)}
 
         for (size_t i = 0; i < chunks.size(); ++i) {
@@ -300,54 +322,91 @@ int main(int argc, char** argv) {
         }
 
         // --- Output Results --- 
-        if (matchingChunkInfo.empty()) {
-            std::cout << "No matches found." << std::endl;
-        } else {
-            std::cout << "Found " << matchingChunkInfo.size() << " matching paragraph(s)." << std::endl;
-            std::set<size_t> printedChunkIndices; 
-
+        if (outputFormat == "json") {
+            json resultsJson = json::array();
+            std::set<size_t> addedChunkIndices;
             for (const auto& matchPair : matchingChunkInfo) {
                 size_t matchIndex = matchPair.first;
-                size_t matchScore = matchPair.second;
+                if (addedChunkIndices.count(matchIndex)) continue;
 
-                // Avoid re-printing context for matches already covered
-                if (printedChunkIndices.count(matchIndex)) {
-                    continue;
-                }
-
+                json resultEntry;
+                resultEntry["match_chunk_index"] = matchIndex;
+                resultEntry["match_score"] = matchPair.second; 
+                
+                json contextChunkArray = json::array();
                 size_t start = (matchIndex > (size_t)contextChunks) ? matchIndex - contextChunks : 0;
                 size_t end = std::min(matchIndex + contextChunks, chunks.size() - 1);
-
-                bool firstChunkInGroup = true;
                 for (size_t i = start; i <= end; ++i) {
-                    if (printedChunkIndices.find(i) == printedChunkIndices.end()) {
-                        if (firstChunkInGroup) {
-                             std::cout << "\n--------------------" << std::endl; 
-                             firstChunkInGroup = false;
-                        }
-                        const auto& chunkToPrint = chunks[i];
-                        std::cout << "[L" << chunkToPrint.startLine 
-                                  << (i == matchIndex ? " (*) " : "     ") // Mark the matching chunk
-                                  << "Chunk " << (i+1) << "/" << chunks.size() << "]";
-                        if (searchMode == "fuzzy" && i == matchIndex) {
-                             std::cout << " (Dist: " << matchScore << ")";
-                        }
-                        std::cout << std::endl;
-
-                        for(const auto& chunkLine : chunkToPrint.lines) {
-                            std::cout << chunkLine << std::endl;
-                        }
-                         std::cout << "---" << std::endl; 
-                        printedChunkIndices.insert(i);
+                     if (addedChunkIndices.find(i) == addedChunkIndices.end()) {
+                        json chunkJson;
+                        chunks[i].to_json(chunkJson, chunks[i]); // Use the to_json helper
+                        chunkJson["is_direct_match"] = (i == matchIndex);
+                        contextChunkArray.push_back(chunkJson);
+                        addedChunkIndices.insert(i);
                     }
                 }
+                resultEntry["context_chunks"] = contextChunkArray;
+                resultsJson.push_back(resultEntry);
             }
-             std::cout << "\n--------------------" << std::endl;
+            std::cout << resultsJson.dump(2) << std::endl; // Pretty print JSON
+
+        } else { // Text output (existing logic)
+            if (matchingChunkInfo.empty()) {
+                std::cout << "No matches found." << std::endl;
+            } else {
+                printInfo("Found " + std::to_string(matchingChunkInfo.size()) + " matching paragraph(s).");
+                std::set<size_t> printedChunkIndices; 
+
+                for (const auto& matchPair : matchingChunkInfo) {
+                    size_t matchIndex = matchPair.first;
+                    size_t matchScore = matchPair.second;
+
+                    // Avoid re-printing context for matches already covered
+                    if (printedChunkIndices.count(matchIndex)) {
+                        continue;
+                    }
+
+                    size_t start = (matchIndex > (size_t)contextChunks) ? matchIndex - contextChunks : 0;
+                    size_t end = std::min(matchIndex + contextChunks, chunks.size() - 1);
+
+                    bool firstChunkInGroup = true;
+                    for (size_t i = start; i <= end; ++i) {
+                        if (printedChunkIndices.find(i) == printedChunkIndices.end()) {
+                            if (firstChunkInGroup) {
+                                 std::cout << "\n--------------------" << std::endl; 
+                                 firstChunkInGroup = false;
+                            }
+                            const auto& chunkToPrint = chunks[i];
+                            std::cout << "[L" << chunkToPrint.startLine 
+                                      << (i == matchIndex ? " (*) " : "     ") // Mark the matching chunk
+                                      << "Chunk " << (i+1) << "/" << chunks.size() << "]";
+                            if (searchMode == "fuzzy" && i == matchIndex) {
+                                 std::cout << " (Dist: " << matchScore << ")";
+                            }
+                            std::cout << std::endl;
+
+                            for(const auto& chunkLine : chunkToPrint.lines) {
+                                std::cout << chunkLine << std::endl;
+                            }
+                             std::cout << "---" << std::endl; 
+                            printedChunkIndices.insert(i);
+                        }
+                    }
+                }
+                 std::cout << "\n--------------------" << std::endl;
+            }
         }
         // --- TODO: Implement semantic search --- 
 
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        // Decide whether to print error as JSON or text
+        if (outputFormat == "json") {
+            json errorJson;
+            errorJson["error"] = e.what();
+            std::cerr << errorJson.dump(2) << std::endl;
+        } else {
+            std::cerr << "Error: " << e.what() << std::endl;
+        }
         return 1; // Indicate error
     }
 
