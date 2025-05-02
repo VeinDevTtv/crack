@@ -13,8 +13,52 @@
 #include "CLI/CLI.hpp"
 #include "python_bridge.h" // Include the Python bridge header
 
+#ifdef _WIN32
+#include <io.h> // For _isatty
+#include <windows.h> // For enabling virtual terminal processing
+#else
+#include <unistd.h> // For isatty
+#endif
+
 // Use nlohmann::json
 using json = nlohmann::json;
+
+// --- ANSI Color Codes --- 
+namespace Color {
+    const std::string RESET = "\033[0m";
+    const std::string BOLD = "\033[1m";
+    const std::string DIM = "\033[2m";
+    const std::string UNDERLINE = "\033[4m";
+    const std::string RED = "\033[31m";
+    const std::string GREEN = "\033[32m";
+    const std::string YELLOW = "\033[33m";
+    const std::string BLUE = "\033[34m";
+    const std::string MAGENTA = "\033[35m";
+    const std::string CYAN = "\033[36m";
+    const std::string GRAY = "\033[90m"; 
+    // Add more as needed
+}
+
+// Function to check if stdout is a TTY
+bool is_stdout_tty() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdout));
+#else
+    return isatty(fileno(stdout));
+#endif
+}
+
+// Function to enable virtual terminal processing on Windows
+void enable_windows_vt_processing() {
+#ifdef _WIN32
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return;
+    DWORD dwMode = 0;
+    if (!GetConsoleMode(hOut, &dwMode)) return;
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if (!SetConsoleMode(hOut, dwMode)) return;
+#endif
+}
 
 // Structure to represent a text chunk
 struct Chunk {
@@ -212,9 +256,9 @@ int main(int argc, char** argv) {
     app.add_option("--chunk-mode", chunkMode, "Chunking strategy (paragraph, brace)")
         ->default_val("paragraph")
         ->check(CLI::IsMember({"paragraph", "brace"}));
-    app.add_option("--output-format", outputFormat, "Output format (text, json)")
+    app.add_option("--output-format", outputFormat, "Output format (text, json, markdown)")
         ->default_val("text")
-        ->check(CLI::IsMember({"text", "json"}));
+        ->check(CLI::IsMember({"text", "json", "markdown"}));
     app.add_option("--semantic-model", semanticModel, "Name of the Sentence Transformer model")
         ->default_val("all-MiniLM-L6-v2");
     app.add_option("--py-script", pythonScript, "Path to the Python semantic search script")
@@ -224,7 +268,24 @@ int main(int argc, char** argv) {
         ->default_val(".venv")
         ->check(CLI::ExistingDirectory);
 
+    std::string colorMode = "auto";
+    app.add_option("--color", colorMode, "When to use color output (always, auto, never)")
+        ->default_val("auto")
+        ->check(CLI::IsMember({"always", "auto", "never"}));
+
     CLI11_PARSE(app, argc, argv);
+
+    // --- Determine color usage --- 
+    bool useColor = false;
+    if (colorMode == "always") {
+        useColor = true;
+    } else if (colorMode == "auto") {
+        useColor = is_stdout_tty();
+    }
+    // Enable VT processing on Windows if colors are used
+    if (useColor) {
+        enable_windows_vt_processing();
+    }
 
     // --- Initialize Python Bridge (if needed) --- 
     bool pythonInitialized = false;
@@ -242,7 +303,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Lambda for conditional output
+    // Lambda for conditional output (using Color namespace)
     auto printInfo = [&](const std::string& msg) {
         if (outputFormat == "text") {
             std::cout << msg << std::endl;
@@ -262,6 +323,7 @@ int main(int argc, char** argv) {
     printInfo("Ignore comments: " + std::string(ignoreComments ? "Yes" : "No"));
     printInfo("Chunk mode: " + chunkMode);
     printInfo("Output format: " + outputFormat);
+    printInfo("Color mode: " + colorMode + " (" + (useColor ? "Active" : "Inactive") + ")");
 
     // --- Main Logic --- 
     try {
@@ -382,9 +444,18 @@ int main(int argc, char** argv) {
                 resultsJson.push_back(resultEntry);
             }
             std::cout << resultsJson.dump(2) << std::endl;
-        } else { // Text output
+        } else if (outputFormat == "markdown") {
+            // --- Markdown Output --- (Placeholder for now)
+            std::cout << "## ContextCracker Results" << std::endl;
+             std::cout << "* File: `" << filePath << "`" << std::endl;
+             std::cout << "* Query: `" << query << "`" << std::endl;
+             std::cout << "* Mode: `" << searchMode << "`" << std::endl;
+             // TODO: Implement detailed markdown formatting for results
+             std::cout << "\n*(Markdown output is incomplete)*" << std::endl;
+
+        } else { // Text output (with color)
             if (results.empty()) {
-                std::cout << "No matches found." << std::endl;
+                std::cout << (useColor ? Color::YELLOW : "") << "No matches found." << (useColor ? Color::RESET : "") << std::endl;
             } else {
                 printInfo("Found " + std::to_string(results.size()) + " matching chunk(s). Displaying context...");
                 std::set<size_t> printedChunkIndices;
@@ -399,33 +470,54 @@ int main(int argc, char** argv) {
                     for (size_t i = start; i <= end; ++i) {
                         if (printedChunkIndices.find(i) == printedChunkIndices.end()) {
                             if (firstChunkInGroup) {
-                                 std::cout << "\n--------------------" << std::endl;
+                                 std::cout << (useColor ? Color::DIM : "") << "\n--------------------" << (useColor ? Color::RESET : "") << std::endl;
                                  firstChunkInGroup = false;
                             }
                             const auto& chunkToPrint = chunks[i];
-                            std::cout << "[L" << chunkToPrint.startLine
-                                      << (i == matchIndex ? " (*) " : "     ")
-                                      << "Chunk " << (i + 1) << "/" << chunks.size() << "]";
+                            // Header line
+                            std::cout << (useColor ? Color::CYAN : "") 
+                                      << "[L" << chunkToPrint.startLine
+                                      << (i == matchIndex ? (useColor ? Color::BOLD + Color::GREEN : "") + " (*) " + (useColor ? Color::RESET + Color::CYAN : "") : "     ")
+                                      << "Chunk " << (i + 1) << "/" << chunks.size() << "]"
+                                      << (useColor ? Color::RESET : "");
+                            
+                            // Score (if applicable)
                             if (i == matchIndex) {
+                                std::stringstream ss;
                                 if (searchMode == "fuzzy") {
-                                    std::cout << " (Dist: " << matchScore << ")";
+                                    ss << " (Dist: " << matchScore << ")";
                                 } else if (searchMode == "semantic") {
-                                     // Format score nicely
-                                     std::stringstream ss;
                                      ss << std::fixed << std::setprecision(4) << matchScore;
-                                     std::cout << " (Score: " << ss.str() << ")";
+                                     ss << " (Score: " << ss.str() << ")";
                                 }
+                                 std::cout << (useColor ? Color::YELLOW : "") << ss.str() << (useColor ? Color::RESET : "");
                             }
                             std::cout << std::endl;
+
+                            // Content lines (highlight matching words? - simple version for now)
                             for (const auto& chunkLine : chunkToPrint.lines) {
-                                std::cout << chunkLine << std::endl;
+                                std::string lineToPrint = chunkLine;
+                                if (useColor && (searchMode == "keyword" || searchMode == "fuzzy") && !query.empty()) {
+                                    // Basic highlighting for keyword/fuzzy (first occurrence)
+                                    size_t pos = lineToPrint.find(query); // case-sensitive
+                                    if (pos != std::string::npos) {
+                                        lineToPrint.replace(pos, query.length(), 
+                                            Color::BOLD + Color::MAGENTA + query + Color::RESET);
+                                    }
+                                    // Note: Fuzzy highlighting is harder - would need to know matched word
+                                }
+                                // Dim context lines that are not the direct match?
+                                bool isContextOnly = (i != matchIndex);
+                                std::cout << (useColor && isContextOnly ? Color::GRAY : "") 
+                                          << lineToPrint 
+                                          << (useColor && isContextOnly ? Color::RESET : "") << std::endl;
                             }
-                            std::cout << "---" << std::endl;
+                            std::cout << (useColor ? Color::DIM : "") << "---" << (useColor ? Color::RESET : "") << std::endl;
                             printedChunkIndices.insert(i);
                         }
                     }
                 }
-                std::cout << "\n--------------------" << std::endl;
+                std::cout << (useColor ? Color::DIM : "") << "\n--------------------" << (useColor ? Color::RESET : "") << std::endl;
             }
         }
 
