@@ -11,6 +11,7 @@
 #include <limits>    // Needed for std::numeric_limits
 #include <nlohmann/json.hpp> // JSON library
 #include "CLI/CLI.hpp"
+#include "python_bridge.h" // Include the Python bridge header
 
 // Use nlohmann::json
 using json = nlohmann::json;
@@ -184,154 +185,186 @@ size_t levenshteinDistance(const std::string &s1, const std::string &s2) {
 
 int main(int argc, char** argv) {
     CLI::App app{"ContextCracker: Semantic context-aware extraction tool"};
+    app.set_config("--config"); // Allow config file
 
-    std::string filePath;
+    // --- Options --- 
+    std::string filePath, query, searchMode = "keyword", chunkMode = "paragraph", outputFormat = "text";
+    int contextChunks = 0, fuzzyTolerance = 2;
+    bool ignoreComments = false;
+    std::string semanticModel = "all-MiniLM-L6-v2";
+    std::string pythonScript = "semantic_searcher.py"; // Default script name
+    std::string venvDir = ".venv"; // Default venv directory
+
     app.add_option("-f,--file", filePath, "Path to the input file")
        ->required()
        ->check(CLI::ExistingFile);
-
-    std::string query;
     app.add_option("-q,--query", query, "Search query")->required();
-
-    int contextChunks = 0;
     app.add_option("-C,--context", contextChunks, "Number of surrounding paragraphs (chunks) to show")
         ->default_val(0)
         ->check(CLI::NonNegativeNumber);
-
-    std::string searchMode = "keyword";
-    app.add_option("-m,--mode", searchMode, "Search mode (keyword, fuzzy)")
+    app.add_option("-m,--mode", searchMode, "Search mode (keyword, fuzzy, semantic)") // Add semantic
         ->default_val("keyword")
-        ->check(CLI::IsMember({"keyword", "fuzzy"}));
-
-    int fuzzyTolerance = 2;
+        ->check(CLI::IsMember({"keyword", "fuzzy", "semantic"})); 
     app.add_option("--tolerance", fuzzyTolerance, "Maximum Levenshtein distance for fuzzy search")
         ->default_val(2)
         ->check(CLI::NonNegativeNumber);
-
-    bool ignoreComments = false;
     app.add_flag("--ignore-comments", ignoreComments, "Ignore lines starting with // or #");
-
-    std::string chunkMode = "paragraph";
     app.add_option("--chunk-mode", chunkMode, "Chunking strategy (paragraph, brace)")
         ->default_val("paragraph")
         ->check(CLI::IsMember({"paragraph", "brace"}));
-
-    std::string outputFormat = "text";
     app.add_option("--output-format", outputFormat, "Output format (text, json)")
         ->default_val("text")
         ->check(CLI::IsMember({"text", "json"}));
+    app.add_option("--semantic-model", semanticModel, "Name of the Sentence Transformer model")
+        ->default_val("all-MiniLM-L6-v2");
+    app.add_option("--py-script", pythonScript, "Path to the Python semantic search script")
+        ->default_val("semantic_searcher.py")
+        ->check(CLI::ExistingFile);
+    app.add_option("--venv-dir", venvDir, "Path to the Python virtual environment directory")
+        ->default_val(".venv")
+        ->check(CLI::ExistingDirectory);
 
     CLI11_PARSE(app, argc, argv);
 
-    // --- Conditional output based on format ---
+    // --- Initialize Python Bridge (if needed) --- 
+    bool pythonInitialized = false;
+    if (searchMode == "semantic") {
+        pythonInitialized = PythonBridge::initialize(pythonScript, venvDir);
+        if (!pythonInitialized) {
+            std::cerr << "Failed to initialize Python bridge. Semantic search disabled." << std::endl;
+            // Fallback or exit? For now, let's exit.
+            return 1;
+        }
+        if (!PythonBridge::load_model(semanticModel)) {
+             std::cerr << "Failed to load semantic model in Python." << std::endl;
+             PythonBridge::finalize();
+             return 1;
+        }
+    }
+
+    // Lambda for conditional output
     auto printInfo = [&](const std::string& msg) {
         if (outputFormat == "text") {
             std::cout << msg << std::endl;
         }
     };
 
+    // Print effective options
     printInfo("Processing file: " + filePath);
     printInfo("Search query: '" + query + "'");
     printInfo("Search mode: " + searchMode);
     if (searchMode == "fuzzy") {
         printInfo("Fuzzy tolerance: " + std::to_string(fuzzyTolerance));
+    } else if (searchMode == "semantic") {
+        printInfo("Semantic model: " + semanticModel);
     }
     printInfo("Context chunks: " + std::to_string(contextChunks));
     printInfo("Ignore comments: " + std::string(ignoreComments ? "Yes" : "No"));
     printInfo("Chunk mode: " + chunkMode);
     printInfo("Output format: " + outputFormat);
 
+    // --- Main Logic --- 
     try {
         std::vector<std::string> fileContent = readFileLines(filePath);
         printInfo("Successfully read " + std::to_string(fileContent.size()) + " lines from file.");
 
-        // --- Chunking --- 
-        std::vector<Chunk> chunks;
-        if (chunkMode == "paragraph") {
-             chunks = chunkByParagraphs(fileContent);
-             printInfo("Chunked content into " + std::to_string(chunks.size()) + " paragraphs (non-blank).");
-        } else if (chunkMode == "brace") {
-            chunks = chunkByBraces(fileContent);
-             printInfo("Chunked content into " + std::to_string(chunks.size()) + " brace-based blocks.");
-        } else {
-             // Should not happen due to CLI11 validation, but good practice
-            throw std::runtime_error("Invalid chunk mode specified.");
-        }
-       
-        // --- Search --- 
+        std::vector<Chunk> chunks = (chunkMode == "brace") ? 
+                                      chunkByBraces(fileContent) : 
+                                      chunkByParagraphs(fileContent);
+        printInfo("Chunked content into " + std::to_string(chunks.size()) + " chunks.");
+
         printInfo("\n--- " + searchMode + " Search Results --- (" + query + ")");
-        std::vector<std::pair<size_t, size_t>> matchingChunkInfo; // Store {chunk_index, match_score (0 for keyword, distance for fuzzy)}
+        
+        // Store results as {chunk_index, score}. Score meaning depends on mode.
+        // Fuzzy: lower is better (distance). Semantic: higher is better (similarity).
+        std::vector<std::pair<size_t, double>> results;
 
-        for (size_t i = 0; i < chunks.size(); ++i) {
-            const auto& chunk = chunks[i];
-            size_t bestMatchScore = std::numeric_limits<size_t>::max(); 
-            bool chunkMatchFound = false;
-
-            for (const auto& line : chunk.lines) {
-                // --- Filtering --- 
-                std::string processedLine = line;
-                // Trim leading whitespace for comment check
-                size_t firstChar = processedLine.find_first_not_of(" \t");
-                if (ignoreComments && firstChar != std::string::npos) {
-                    if (processedLine.rfind("//", firstChar) == firstChar || 
-                        processedLine.rfind("#", firstChar) == firstChar) {
-                        continue; // Skip this line if it's a comment
+        // --- Perform Search --- 
+        if (searchMode == "keyword" || searchMode == "fuzzy") {
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                const auto& chunk = chunks[i];
+                double bestMatchScore = (searchMode == "keyword") ? 0.0 : std::numeric_limits<double>::max();
+                bool chunkMatchFound = false;
+                for (const auto& line : chunk.lines) {
+                    std::string processedLine = line;
+                    size_t firstChar = processedLine.find_first_not_of(" \t");
+                    if (ignoreComments && firstChar != std::string::npos && (processedLine.rfind("//", firstChar) == firstChar || processedLine.rfind("#", firstChar) == firstChar)) {
+                        continue;
+                    }
+                    if (searchMode == "keyword") {
+                        if (processedLine.find(query) != std::string::npos) {
+                            bestMatchScore = 1.0; // Max score for keyword
+                            chunkMatchFound = true;
+                            break;
+                        }
+                    } else { // Fuzzy
+                        size_t queryLen = query.length();
+                        if (queryLen == 0) continue;
+                        for (size_t j = 0; (j = processedLine.find_first_not_of(" \t\n\r", j)) != std::string::npos; ) {
+                             size_t wordEnd = processedLine.find_first_of(" \t\n\r", j);
+                             if (wordEnd == std::string::npos) wordEnd = processedLine.length();
+                             std::string word = processedLine.substr(j, wordEnd - j);
+                             size_t distance = levenshteinDistance(word, query);
+                             if (distance <= (size_t)fuzzyTolerance) {
+                                  if (static_cast<double>(distance) < bestMatchScore) {
+                                     bestMatchScore = static_cast<double>(distance);
+                                 }
+                                 chunkMatchFound = true;
+                             }
+                             if (wordEnd == processedLine.length()) break;
+                             j = wordEnd + 1;
+                        }
                     }
                 }
-                // --- End Filtering ---
-
-                if (searchMode == "keyword") {
-                    if (processedLine.find(query) != std::string::npos) { // Search on processedLine
-                        bestMatchScore = 0; 
-                        chunkMatchFound = true;
-                        break; 
-                    }
-                } else if (searchMode == "fuzzy") {
-                    size_t queryLen = query.length();
-                    if (queryLen == 0) continue;
-                    for (size_t j = 0; (j = processedLine.find_first_not_of(" \t\n\r", j)) != std::string::npos; ) {
-                         size_t wordEnd = processedLine.find_first_of(" \t\n\r", j);
-                         if (wordEnd == std::string::npos) {
-                            wordEnd = processedLine.length(); 
-                         }
-                         std::string word = processedLine.substr(j, wordEnd - j);
-                         
-                         size_t distance = levenshteinDistance(word, query);
-                         if (distance <= (size_t)fuzzyTolerance) {
-                              if (distance < bestMatchScore) {
-                                 bestMatchScore = distance;
-                             }
-                             chunkMatchFound = true;
-                         }
-                         if (wordEnd == processedLine.length()) break;
-                         j = wordEnd + 1;
-                    }
-                } 
-            } 
-            if (chunkMatchFound) {
-                matchingChunkInfo.push_back({i, bestMatchScore});
+                if (chunkMatchFound) {
+                    results.push_back({i, bestMatchScore});
+                }
             }
-        } 
+        } else if (searchMode == "semantic") {
+            if (!pythonInitialized) {
+                 throw std::runtime_error("Semantic search requested but Python bridge failed to initialize.");
+            }
+            std::vector<std::string> chunkTexts;
+            chunkTexts.reserve(chunks.size());
+            for(const auto& chunk : chunks) {
+                // Use contentAsString to pass the whole chunk text to Python model
+                chunkTexts.push_back(chunk.contentAsString()); 
+            }
+            
+            std::optional<std::vector<SemanticResult>> semanticResultsOpt = PythonBridge::find_similar(query, chunkTexts);
 
-        // --- Sort Results (for fuzzy, lower distance is better) ---
-        if (searchMode == "fuzzy") {
-             std::sort(matchingChunkInfo.begin(), matchingChunkInfo.end(), 
-                       [](const auto& a, const auto& b) {
-                           return a.second < b.second; // Sort by distance (ascending)
-                       });
+            if(semanticResultsOpt.has_value()) {
+                for(const auto& res : semanticResultsOpt.value()) {
+                    results.push_back({res.chunkIndex, res.score});
+                }
+            } else {
+                printInfo("Semantic search failed or returned no results.");
+                // No results added
+            }
         }
+
+        // --- Sort Results --- 
+        if (searchMode == "fuzzy") {
+            // Lower distance is better
+            std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+        } else if (searchMode == "semantic") {
+            // Higher score is better
+             std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        } // Keyword doesn't need sorting by score (all 1.0 or not present)
+        
 
         // --- Output Results --- 
         if (outputFormat == "json") {
             json resultsJson = json::array();
             std::set<size_t> addedChunkIndices;
-            for (const auto& matchPair : matchingChunkInfo) {
+            for (const auto& matchPair : results) { // Use combined results vector
                 size_t matchIndex = matchPair.first;
                 if (addedChunkIndices.count(matchIndex)) continue;
 
                 json resultEntry;
                 resultEntry["match_chunk_index"] = matchIndex;
-                resultEntry["match_score"] = matchPair.second; 
+                resultEntry["match_score"] = matchPair.second;
+                resultEntry["search_mode"] = searchMode;
                 
                 json contextChunkArray = json::array();
                 size_t start = (matchIndex > (size_t)contextChunks) ? matchIndex - contextChunks : 0;
@@ -339,7 +372,7 @@ int main(int argc, char** argv) {
                 for (size_t i = start; i <= end; ++i) {
                      if (addedChunkIndices.find(i) == addedChunkIndices.end()) {
                         json chunkJson;
-                        chunks[i].to_json(chunkJson, chunks[i]); // Use the to_json helper
+                        chunks[i].to_json(chunkJson, chunks[i]);
                         chunkJson["is_direct_match"] = (i == matchIndex);
                         contextChunkArray.push_back(chunkJson);
                         addedChunkIndices.insert(i);
@@ -348,55 +381,53 @@ int main(int argc, char** argv) {
                 resultEntry["context_chunks"] = contextChunkArray;
                 resultsJson.push_back(resultEntry);
             }
-            std::cout << resultsJson.dump(2) << std::endl; // Pretty print JSON
-
-        } else { // Text output (existing logic)
-            if (matchingChunkInfo.empty()) {
+            std::cout << resultsJson.dump(2) << std::endl;
+        } else { // Text output
+            if (results.empty()) {
                 std::cout << "No matches found." << std::endl;
             } else {
-                printInfo("Found " + std::to_string(matchingChunkInfo.size()) + " matching paragraph(s).");
-                std::set<size_t> printedChunkIndices; 
-
-                for (const auto& matchPair : matchingChunkInfo) {
+                printInfo("Found " + std::to_string(results.size()) + " matching chunk(s). Displaying context...");
+                std::set<size_t> printedChunkIndices;
+                for (const auto& matchPair : results) {
                     size_t matchIndex = matchPair.first;
-                    size_t matchScore = matchPair.second;
-
-                    // Avoid re-printing context for matches already covered
-                    if (printedChunkIndices.count(matchIndex)) {
-                        continue;
-                    }
+                    double matchScore = matchPair.second;
+                    if (printedChunkIndices.count(matchIndex)) continue;
 
                     size_t start = (matchIndex > (size_t)contextChunks) ? matchIndex - contextChunks : 0;
                     size_t end = std::min(matchIndex + contextChunks, chunks.size() - 1);
-
                     bool firstChunkInGroup = true;
                     for (size_t i = start; i <= end; ++i) {
                         if (printedChunkIndices.find(i) == printedChunkIndices.end()) {
                             if (firstChunkInGroup) {
-                                 std::cout << "\n--------------------" << std::endl; 
+                                 std::cout << "\n--------------------" << std::endl;
                                  firstChunkInGroup = false;
                             }
                             const auto& chunkToPrint = chunks[i];
-                            std::cout << "[L" << chunkToPrint.startLine 
-                                      << (i == matchIndex ? " (*) " : "     ") // Mark the matching chunk
-                                      << "Chunk " << (i+1) << "/" << chunks.size() << "]";
-                            if (searchMode == "fuzzy" && i == matchIndex) {
-                                 std::cout << " (Dist: " << matchScore << ")";
+                            std::cout << "[L" << chunkToPrint.startLine
+                                      << (i == matchIndex ? " (*) " : "     ")
+                                      << "Chunk " << (i + 1) << "/" << chunks.size() << "]";
+                            if (i == matchIndex) {
+                                if (searchMode == "fuzzy") {
+                                    std::cout << " (Dist: " << matchScore << ")";
+                                } else if (searchMode == "semantic") {
+                                     // Format score nicely
+                                     std::stringstream ss;
+                                     ss << std::fixed << std::setprecision(4) << matchScore;
+                                     std::cout << " (Score: " << ss.str() << ")";
+                                }
                             }
                             std::cout << std::endl;
-
-                            for(const auto& chunkLine : chunkToPrint.lines) {
+                            for (const auto& chunkLine : chunkToPrint.lines) {
                                 std::cout << chunkLine << std::endl;
                             }
-                             std::cout << "---" << std::endl; 
+                            std::cout << "---" << std::endl;
                             printedChunkIndices.insert(i);
                         }
                     }
                 }
-                 std::cout << "\n--------------------" << std::endl;
+                std::cout << "\n--------------------" << std::endl;
             }
         }
-        // --- TODO: Implement semantic search --- 
 
     } catch (const std::exception& e) {
         // Decide whether to print error as JSON or text
@@ -407,7 +438,13 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "Error: " << e.what() << std::endl;
         }
+        if (pythonInitialized) PythonBridge::finalize(); // Finalize python on error too
         return 1; // Indicate error
+    }
+
+    // --- Finalize Python Bridge --- 
+    if (pythonInitialized) {
+        PythonBridge::finalize();
     }
 
     return 0;
