@@ -11,9 +11,17 @@ include(FetchContent)
 FetchContent_Declare(
   CLI11
   GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-  GIT_TAG        v2.3.2 # Or latest stable tag
+  GIT_TAG        v2.4.2 # Or latest stable tag
 )
 FetchContent_MakeAvailable(CLI11)
+
+# Fetch nlohmann/json for JSON output
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3 # Or latest stable tag
+)
+FetchContent_MakeAvailable(nlohmann_json)
 
 # --- Executable ---
 
@@ -24,6 +32,7 @@ target_include_directories(context_cracker PUBLIC
   $<INSTALL_INTERFACE:include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> # If you create an include dir
   ${cli11_SOURCE_DIR}/include
+  ${nlohmann_json_SOURCE_DIR}/include # Add nlohmann include dir
 )
 
 target_link_libraries(context_cracker PRIVATE CLI11::CLI11)
